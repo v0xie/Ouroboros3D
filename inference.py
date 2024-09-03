@@ -27,7 +27,7 @@ import torchvision
 from kiui.op import recenter
 
 bg_remover = rembg.new_session()
-
+pipeline, mv_model, recon_model = None, None, None
 
 def _encode_cond(image, do_classifier_free_guidance=False):
     device, dtype = image.device, image.dtype
@@ -113,6 +113,7 @@ def get_cameras(c2w, fov):
 
 @torch.no_grad
 def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True):
+    global pipeline, mv_model, recon_model
     condition_image = batch["condition_image"]  # cond image b x c x h x w
     # interplate to 512 x 512
     condition_image = F.interpolate(
@@ -127,6 +128,7 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
 
     timesteps = scheduler.timesteps
 
+    pipeline = pipeline.to('cuda')
     image_embeddings = _encode_cond(condition_image, do_classifier_free_guidance=True)
 
     condition_image = condition_image + torch.randn_like(condition_image) * 0.02
@@ -139,6 +141,12 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
         cond_image_latent = torch.cat(
             [torch.zeros_like(cond_image_latent), cond_image_latent]
         )
+
+    pipeline = pipeline.to('cpu')
+    torch.cuda.empty_cache()
+    
+    if mv_model:
+        mv_model = mv_model.to('cuda')
 
     added_time_ids = _get_add_time_ids(
         mv_model.unet,
@@ -189,6 +197,9 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
                 else cond
             )
 
+            # load
+            mv_model = mv_model.to('cuda')
+
             noise_pred = mv_model(
                 latent_model_input,
                 t,
@@ -205,6 +216,10 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
                 ),
             )
 
+            # unload mv
+            mv_model = mv_model.to('cpu')
+            torch.cuda.empty_cache()
+
             # perform guidance
             if do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
@@ -212,12 +227,27 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
                     noise_pred_cond - noise_pred_uncond
                 )
 
+            # load pipeline - requires 18+ GB VRAM
+            pipeline = pipeline.to('cuda')
+
             output = scheduler.step(noise_pred, t, latents)
             pred_x0_latent = output.pred_original_sample
             pred_x0 = pipeline.decode_latents(pred_x0_latent, num_frames=m)
             pred_x0 = rearrange(pred_x0, "b c m h w -> b m c h w")
 
+            # unload pipeline - requires 18+ GB VRAM
+            pipeline = pipeline.to('cpu')
+            torch.cuda.empty_cache()
+
+            # load recon
+            recon_model = recon_model.to('cuda')
+
             recon_results = recon_model(pred_x0, batch, t)
+
+            # unload recon
+            recon_model = recon_model.to('cpu')
+            torch.cuda.empty_cache()
+
             depth = recon_results["depths_pred"]
 
             position_map = get_position_map(
@@ -232,15 +262,23 @@ def generate_images(batch, num_inference_steps, do_classifier_free_guidance=True
 
         cond = recon_results["images_pred"].to(dtype)
 
+        # load pipeline
+        pipeline = pipeline.to('cuda')
+
         frames = pipeline.decode_latents(latents, num_frames=m)  # b c m h w
         frames = rearrange(frames, "b c m h w -> (b m) c h w")
         images_pred = pipeline.image_processor.postprocess(frames, output_type="pt")
         images_pred = rearrange(images_pred, "(b m) c h w -> b m c h w", b=b, m=m)
 
+        # unload pipeline
+        pipeline = pipeline.to('cpu')
+        torch.cuda.empty_cache()
+
         return images_pred, cond[:, :, :3], recon_results
 
 
 def process(input_path, input_num_steps=25, input_seed=42):
+    global pipeline, mv_model, recon_model
 
     # seed
     kiui.seed_everything(input_seed)
@@ -301,6 +339,10 @@ def process(input_path, input_num_steps=25, input_seed=42):
     torchvision.utils.save_image(mv_images, output_image_path, nrow=4)
 
     gaussians = recon_result["gaussians"]
+
+    # load recon
+    recon_model = recon_model.to('cuda')
+
     recon_model.gs.save_ply(gaussians, output_ply_path)
 
     images = []
@@ -353,6 +395,10 @@ def process(input_path, input_num_steps=25, input_seed=42):
 
     images = np.concatenate(images, axis=0)
     imageio.mimwrite(output_video_path, images, fps=30)
+
+    # unload recon model
+    recon_model = recon_model.to('cpu')
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -409,11 +455,11 @@ if __name__ == "__main__":
     recon_model = hydra.utils.instantiate(conf.recon_model)
 
     # Load the model weights
-    mv_model.load_state_dict(torch.load(mv_model_ckpt, map_location="cpu"))
-    recon_model.load_state_dict(torch.load(recon_model_ckpt, map_location="cpu"))
+    mv_model.load_state_dict(torch.load(mv_model_ckpt, map_location="cpu", weights_only=True))
+    recon_model.load_state_dict(torch.load(recon_model_ckpt, map_location="cpu", weights_only=True))
 
-    mv_model = mv_model.to(device)
-    recon_model = recon_model.to(device)
-    pipeline = pipeline.to(device)
+    mv_model = mv_model.to('cpu')
+    recon_model = recon_model.to('cpu')
+    pipeline = pipeline.to('cpu')
 
     process(args.input, args.num_inference_steps, args.seed)
